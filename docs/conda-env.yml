@@ -1,0 +1,5 @@
+name: nbconvert_docs
+dependencies:
+- nbformat
+- jupyter_client
+- ipykernel
