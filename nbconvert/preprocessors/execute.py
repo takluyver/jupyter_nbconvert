@@ -12,6 +12,8 @@ try:
 except ImportError:
     from Queue import Empty  # Py 2
 
+import asyncio
+
 from traitlets import List, Unicode, Bool, Enum, Any, Type, Dict, Integer, default
 
 from nbformat.v4 import output_from_msg
@@ -208,7 +210,6 @@ class ExecutePreprocessor(Preprocessor):
               }
               """))
 
-    @contextmanager
     def setup_preprocessor(self, nb, resources, km=None):
         """
         Context manager for setting up the class to execute a notebook.
@@ -251,33 +252,29 @@ class ExecutePreprocessor(Preprocessor):
         self._display_id_map = {}
 
         kf = KernelFinder.from_entrypoints()
-        if self.kernel_name:
-            kernel_name = self.kernel_name
-            if '/' not in kernel_name:
-                kernel_name = 'spec/' + kernel_name
-        else:
+
+        # Check for unset kernel_name first and attempt to pull from metadata.  Only then
+        # should we check for provider id prefixes, otherwise we could end up with a double prefix.
+        kernel_name = self.kernel_name
+        if not kernel_name:
             try:
-                kernel_name = 'spec/' + nb.metadata.get('kernelspec', {})[
-                    'name']
+                kernel_name = nb.metadata.get('kernelspec', {})['name']
             except KeyError:
                 kernel_name = 'pyimport/kernel'
 
+        # Ensure kernel_name is of the new form in case of older metadata
+        if '/' not in kernel_name:
+            kernel_name = 'spec/' + kernel_name
+
         self.log.info("Launching kernel %s to execute notebook" % kernel_name)
-        conn_info, self.km = kf.launch(kernel_name, cwd=path)
+        conn_info, self.km = asyncio.get_event_loop().run_until_complete(kf.launch(kernel_name, cwd=path))
         self.kc = BlockingKernelClient(conn_info, manager=self.km)
         self.kc.wait_for_ready()
 
         self.kc.allow_stdin = False
         self.nb = nb
 
-        try:
-            yield nb, self.km, self.kc
-        finally:
-            if self.shutdown_kernel == 'immediate':
-                self.km.kill()
-            else:
-                self.kc.shutdown_or_terminate()
-            self.kc.close()
+        return nb
 
     def preprocess(self, nb, resources, km=None):
         """
@@ -305,10 +302,17 @@ class ExecutePreprocessor(Preprocessor):
             Additional resources used in the conversion process.
         """
 
-        with self.setup_preprocessor(nb, resources, km=km):
+        nb = self.setup_preprocessor(nb, resources, km=km)
+        try:
             nb, resources = super(ExecutePreprocessor, self).preprocess(nb, resources)
             info_dict = self.kc.loop_client.kernel_info_dict
             nb.metadata['language_info'] = info_dict['language_info']
+        finally:
+            if self.shutdown_kernel == 'immediate':
+                asyncio.get_event_loop().run_until_complete(self.km.kill())
+            else:
+                self.kc.shutdown_or_terminate()
+            self.kc.close()
 
         return nb, resources
 
